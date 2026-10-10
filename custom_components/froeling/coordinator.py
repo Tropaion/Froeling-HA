@@ -11,20 +11,28 @@ HA coordinator docs:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CONF_CONNECTION_TYPE,
+    CONF_HOST,
     CONF_PARAMETER_TITLES,
+    CONF_PORT,
     CONF_SCAN_INTERVAL,
     CONF_SELECTED_PARAMETERS,
     CONF_SELECTED_SENSORS,
     CONF_SENSOR_SPECS,
+    CONF_SERIAL_DEVICE,
     CONF_WRITE_ENABLED,
+    CONN_TYPE_NETWORK,
+    CONN_TYPE_SERIAL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
@@ -38,8 +46,54 @@ from .pyfroeling import (
     ValueSpec,
     WritableParameter,
 )
+from .pyfroeling.const import MenuStructType
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def cached_specs(data: Mapping[str, Any]) -> list[ValueSpec]:
+    """Return the sensor specs the config flow cached in entry ``data``.
+
+    Empty for entries created before the cache existed; those have to walk
+    the controller's value list (GET_VALUE_LIST_FIRST / NEXT) instead.
+    """
+    return [
+        ValueSpec(
+            address   = s["address"],
+            factor    = s["factor"],
+            unit      = s["unit"],
+            title     = s["title"],
+            menu_type = s["menu_type"],
+        )
+        for s in data.get(CONF_SENSOR_SPECS, [])
+    ]
+
+
+def cached_parameter_titles(data: Mapping[str, Any]) -> dict[int, str]:
+    """Return the writable-parameter titles the config flow cached in entry ``data``.
+
+    Keys are stored as hex strings like "0x00A3"; malformed ones are skipped.
+    The config flow stores every writable parameter it found, not only the
+    selected ones.
+    """
+    titles: dict[int, str] = {}
+    for addr_str, title in data.get(CONF_PARAMETER_TITLES, {}).items():
+        try:
+            titles[int(addr_str, 16)] = title
+        except (ValueError, TypeError):
+            _LOGGER.debug("Ignoring invalid parameter title key: %r", addr_str)
+    return titles
+
+
+def create_client(data: Mapping[str, Any]) -> FroelingClient:
+    """Create an (unconnected) client for the connection stored in entry ``data``.
+
+    Shared by entry setup and the config/options flows so the TCP vs. serial
+    decision lives in one place.
+    """
+    if data.get(CONF_CONNECTION_TYPE, CONN_TYPE_NETWORK) == CONN_TYPE_SERIAL:
+        return FroelingClient(serial_device=data.get(CONF_SERIAL_DEVICE, ""))
+    return FroelingClient(host=data.get(CONF_HOST, ""), port=data.get(CONF_PORT, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +157,17 @@ class FroelingCoordinator(DataUpdateCoordinator[FroelingData]):
        log, and (when write mode is enabled) the current writable parameter
        values, bundling them all into a :class:`FroelingData` snapshot.
 
-    On reconnect: if the TCP connection has dropped between polls, we call
-    ``client.connect()`` before attempting to read data.
+    On reconnect: if the TCP connection has dropped between polls (closed or
+    reset by the bridge, or reset by the client after it could not
+    re-synchronise the byte stream), ``client.ensure_connected()`` reconnects
+    before any data is read; it is also called before every write.
+    Recovering from stray bytes or late replies on a still-open connection is
+    handled inside :class:`FroelingClient`.
     """
+
+    # The base class types this as optional (a coordinator may live without a
+    # config entry); this one always gets its entry in __init__.
+    config_entry: ConfigEntry
 
     def __init__(
         self,
@@ -182,17 +244,7 @@ class FroelingCoordinator(DataUpdateCoordinator[FroelingData]):
         # Loading them here means every poll can use the real German title
         # (e.g. "Betriebsart") instead of the "Parameter 0x02F5" placeholder.
         # -----------------------------------------------------------------------
-        self._parameter_titles: dict[int, str] = {}
-        for addr_str, title in config_entry.data.get(CONF_PARAMETER_TITLES, {}).items():
-            try:
-                # Config entry stores addresses as hex strings like "0x00A3"
-                self._parameter_titles[int(addr_str, 16)] = title
-            except (ValueError, TypeError):
-                # Skip any malformed entries that survived into the config store
-                _LOGGER.debug(
-                    "FroelingCoordinator: ignoring invalid parameter title key: %r",
-                    addr_str,
-                )
+        self._parameter_titles: dict[int, str] = cached_parameter_titles(config_entry.data)
 
         _LOGGER.debug(
             "FroelingCoordinator: write_enabled=%s, parameter_addresses=%s",
@@ -223,21 +275,11 @@ class FroelingCoordinator(DataUpdateCoordinator[FroelingData]):
         UpdateFailed
             If live discovery is needed and it fails for any reason.
         """
-        cached_specs = self.config_entry.data.get(CONF_SENSOR_SPECS, [])
+        # Fast path: rebuild ValueSpec objects from the cached dicts.
+        # This avoids the ~90-second discovery exchange on every HA restart.
+        self._specs = cached_specs(self.config_entry.data)
 
-        if cached_specs:
-            # Fast path: rebuild ValueSpec objects from the cached dicts.
-            # This avoids the ~90-second discovery exchange on every HA restart.
-            self._specs = [
-                ValueSpec(
-                    address   = s["address"],
-                    factor    = s["factor"],
-                    unit      = s["unit"],
-                    title     = s["title"],
-                    menu_type = s["menu_type"],
-                )
-                for s in cached_specs
-            ]
+        if self._specs:
             _LOGGER.info(
                 "FroelingCoordinator: loaded %d cached sensor specs from config entry",
                 len(self._specs),
@@ -289,12 +331,12 @@ class FroelingCoordinator(DataUpdateCoordinator[FroelingData]):
         try:
             # --- Reconnect if needed ---
             # The TCP connection might have been dropped by the serial bridge
-            # (many converters have a configurable idle timeout).
-            if not self.client.is_connected:
-                _LOGGER.info(
-                    "FroelingCoordinator: TCP connection lost, reconnecting…"
-                )
-                await self.client.connect()
+            # (many converters have a configurable idle timeout), or reset by
+            # the client because the heater stopped answering (e.g. while it
+            # restarts).  A fresh connection starts with an empty stream.
+            # Always called: it also notices a session the bridge closed
+            # behind stray bytes, which is_connected cannot see yet.
+            await self.client.ensure_connected()
 
             # --- Fetch heater status (state + firmware version) ---
             status = await self.client.get_status()
@@ -353,7 +395,7 @@ class FroelingCoordinator(DataUpdateCoordinator[FroelingData]):
                         address=addr,
                         title=title,
                         # Assume numeric type; actual type is irrelevant for reading
-                        menu_type=0x07,
+                        menu_type=MenuStructType.PAR,
                         value=param.value,
                         unit=param.unit,
                         digits=param.digits,
@@ -418,6 +460,12 @@ class FroelingCoordinator(DataUpdateCoordinator[FroelingData]):
             "async_write_parameter: writing 0x%04X = %s (factor=%d)",
             address, value, factor,
         )
+        # The client may have reset the connection since the last poll (e.g.
+        # the heater stopped answering during the write-mode parameter reads,
+        # which do not fail the poll), so reconnect here instead of failing
+        # every write until the next poll.
+        await self.client.ensure_connected()
+
         # Delegate to the client; it handles the protocol handshake.
         # set_parameter() sends the write, reads two echo frames, and
         # re-reads the parameter with GET_PARAMETER to confirm (~1-2s total).
@@ -436,31 +484,6 @@ class FroelingCoordinator(DataUpdateCoordinator[FroelingData]):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _schedule_post_write_refresh(self) -> None:
-        """Reset the polling timer so the next update happens in ~2 seconds.
-
-        Temporarily shortens the update interval. A one-shot listener restores
-        the normal interval after exactly one poll cycle (no duplicate polls).
-        """
-        from datetime import timedelta
-
-        # Store the original interval if not already saved
-        if not hasattr(self, '_original_interval'):
-            self._original_interval = self.update_interval
-
-        # Set a short interval so the next poll fires quickly
-        self.update_interval = timedelta(seconds=2)
-
-        # One-shot listener: restore normal interval after the next update
-        def _on_next_update() -> None:
-            if hasattr(self, '_original_interval'):
-                self.update_interval = self._original_interval
-                del self._original_interval
-            # Remove ourselves so we only fire once
-            remove_listener()
-
-        remove_listener = self.async_add_listener(_on_next_update)
 
     def _get_selected_specs(self) -> list[ValueSpec]:
         """Return only the specs that the user selected during setup.

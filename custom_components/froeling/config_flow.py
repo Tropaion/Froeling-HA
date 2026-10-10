@@ -13,6 +13,11 @@ Setup flow:
 IMPORTANT: Every async_show_progress(step_id=X) requires a method
 async_step_X. Every async_show_progress_done(next_step_id=Y) requires
 a method async_step_Y.
+
+One connection per heater: while a config entry is loaded, its coordinator
+owns the (only) connection to the bridge.  The options flow and reconfigure
+borrow that connection instead of opening a second one, and adding an
+already configured heater aborts before any discovery traffic.
 """
 
 from __future__ import annotations
@@ -20,18 +25,28 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import voluptuous as vol
+if TYPE_CHECKING:
+    # Home Assistant 2026.10+ validates with probatio and aliases
+    # ``import voluptuous`` to it at runtime, so its flow APIs are typed with
+    # probatio schemas.  Type-check against that; importing probatio at
+    # runtime would break older Home Assistant versions that do not ship it.
+    import probatio as vol
+else:
+    import voluptuous as vol
 
 from homeassistant.config_entries import (
     ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import callback
 from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
@@ -59,6 +74,7 @@ from .const import (
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
 )
+from .coordinator import cached_parameter_titles, cached_specs, create_client
 from .pyfroeling import FroelingClient, FroelingConnectionError, ValueSpec, WritableParameter
 
 _LOGGER = logging.getLogger(__name__)
@@ -75,13 +91,16 @@ class DiscoveredSensor:
     readable: bool
 
 
-async def _validate_and_discover(client: FroelingClient) -> list[DiscoveredSensor]:
-    """Single-connection sensor discovery (proven v0.5.1 approach)."""
-    ok = await client.check_connection()
-    if not ok:
-        raise FroelingConnectionError("Heater did not respond to CHECK command")
+async def _validate_and_discover(
+    client: FroelingClient, specs: list[ValueSpec] | None = None
+) -> list[DiscoveredSensor]:
+    """Single-connection sensor discovery (proven v0.5.1 approach).
 
-    specs = await client.discover_sensors()
+    Non-empty ``specs`` (e.g. cached in the config entry) skip the slow
+    value-list walk; only the current values are read then.
+    """
+    if not specs:
+        specs = await client.discover_sensors()
     discovered: list[DiscoveredSensor] = []
     failure_count = 0
 
@@ -175,11 +194,77 @@ def _is_expert_param(param: WritableParameter) -> bool:
     return not is_basic_param(param.address)
 
 
-def _create_client_from_data(data: dict[str, Any]) -> FroelingClient:
-    conn_type = data.get(CONF_CONNECTION_TYPE, CONN_TYPE_NETWORK)
-    if conn_type == CONN_TYPE_SERIAL:
-        return FroelingClient(serial_device=data[CONF_SERIAL_DEVICE])
-    return FroelingClient(host=data[CONF_HOST], port=data[CONF_PORT])
+def _unique_id(data: Mapping[str, Any]) -> str:
+    """Return the config entry unique ID for the connection described by ``data``."""
+    if data.get(CONF_CONNECTION_TYPE, CONN_TYPE_NETWORK) == CONN_TYPE_SERIAL:
+        return f"serial:{data.get(CONF_SERIAL_DEVICE, '')}"
+    return f"{data.get(CONF_HOST, '')}:{data.get(CONF_PORT, '')}"
+
+
+# Seconds a bridge may need after one session closed before the heater
+# answers on the next one (the EE10 in particular).
+_BRIDGE_SETTLE: float = 1.0
+
+
+@asynccontextmanager
+async def _temporary_client(data: Mapping[str, Any]) -> AsyncIterator[FroelingClient]:
+    """Open a connection for the ``async with`` block, verified with CHECK.
+
+    The first CHECK on a fresh session can go unanswered while the bridge is
+    still settling after a previous session, so one more attempt is made on
+    a new connection after ``_BRIDGE_SETTLE``.
+
+    Raises
+    ------
+    FroelingConnectionError
+        If the bridge cannot be reached or the heater does not answer.
+    """
+    client = create_client(data)
+    try:
+        await client.connect()
+        if not await client.check_connection():
+            await asyncio.sleep(_BRIDGE_SETTLE)
+            await client.ensure_connected()
+            if not await client.check_connection():
+                raise FroelingConnectionError("Heater did not respond to CHECK command")
+        yield client
+    finally:
+        await client.disconnect()
+
+
+@asynccontextmanager
+async def _entry_client(entry: ConfigEntry) -> AsyncIterator[FroelingClient]:
+    """Yield a client for ``entry``'s heater without opening a second connection.
+
+    A second connection to the same bridge would either kick the
+    coordinator's session (bridges allowing one client) or receive and steal
+    its replies (bridges forwarding to all clients), and a serial port must
+    not be read by two owners.  So:
+
+      - entry loaded: borrow the coordinator's live client.  Its requests
+        interleave with polls one exchange at a time, which is safe: every
+        request/response pair, write sequence and paginated list walk holds
+        the client's lock.
+      - entry being set up, unloaded, or waiting to retry setup: its
+        connection is in use or about to be opened by Home Assistant, so
+        raise FroelingConnectionError instead.
+      - otherwise nothing else is connected: open a temporary connection.
+    """
+    if entry.state is ConfigEntryState.LOADED:
+        client: FroelingClient = entry.runtime_data.client
+        await client.ensure_connected()
+        yield client
+    elif entry.state in (
+        ConfigEntryState.SETUP_IN_PROGRESS,
+        ConfigEntryState.SETUP_RETRY,
+        ConfigEntryState.UNLOAD_IN_PROGRESS,
+    ):
+        raise FroelingConnectionError(
+            "The integration is connecting to the heater; try again in a moment."
+        )
+    else:
+        async with _temporary_client(entry.data) as client:
+            yield client
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +293,11 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(config_entry: ConfigEntry) -> FroelingOptionsFlow:
         return FroelingOptionsFlow(config_entry)
 
-    def _make_client(self) -> FroelingClient:
+    def _connection_data(self) -> dict[str, Any]:
+        """Return the connection settings entered so far, as stored in entry data."""
         if self._conn_type == CONN_TYPE_SERIAL:
-            return FroelingClient(serial_device=self._serial_device)
-        return FroelingClient(host=self._host, port=self._port)
+            return {CONF_CONNECTION_TYPE: CONN_TYPE_SERIAL, CONF_SERIAL_DEVICE: self._serial_device}
+        return {CONF_CONNECTION_TYPE: CONN_TYPE_NETWORK, CONF_HOST: self._host, CONF_PORT: self._port}
 
     # ------------------------------------------------------------------
     # Step 1: Connection type menu
@@ -230,6 +316,10 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
             self._device_name = user_input[CONF_DEVICE_NAME]
             self._host = user_input[CONF_HOST]
             self._port = user_input[CONF_PORT]
+            # Abort before discovery opens a second connection to a bridge
+            # that a loaded entry is already using.
+            await self.async_set_unique_id(_unique_id(self._connection_data()))
+            self._abort_if_unique_id_configured()
             # Go to sensor discovery progress step
             return await self.async_step_discover_sensors()
 
@@ -249,6 +339,9 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
             self._conn_type = CONN_TYPE_SERIAL
             self._device_name = user_input[CONF_DEVICE_NAME]
             self._serial_device = user_input[CONF_SERIAL_DEVICE]
+            # Abort before discovery opens a configured serial port twice.
+            await self.async_set_unique_id(_unique_id(self._connection_data()))
+            self._abort_if_unique_id_configured()
             return await self.async_step_discover_sensors()
 
         schema = vol.Schema({
@@ -264,12 +357,8 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _do_sensor_discovery(self) -> None:
         """Background task for sensor discovery."""
-        client = self._make_client()
-        try:
-            await client.connect()
+        async with _temporary_client(self._connection_data()) as client:
             self._discovered = await _validate_and_discover(client)
-        finally:
-            await client.disconnect()
 
     async def async_step_discover_sensors(self, user_input=None) -> ConfigFlowResult:
         """Show progress spinner while discovering sensors."""
@@ -349,15 +438,9 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _do_param_discovery(self) -> None:
         """Background task for parameter discovery."""
-        await asyncio.sleep(1.0)  # Let EE10 recover from sensor discovery
-        client = self._make_client()
-        try:
-            await client.connect()
-            await client.check_connection()
+        async with _temporary_client(self._connection_data()) as client:
             menu_items = await client.discover_menu()
             self._writable_params = await client.get_writable_parameters(menu_items)
-        finally:
-            await client.disconnect()
 
     async def async_step_discover_params(self, user_input=None) -> ConfigFlowResult:
         """Show progress spinner while discovering parameters."""
@@ -436,14 +519,14 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_finish_setup(self, user_input=None) -> ConfigFlowResult:
         """User chose to skip expert parameters -- create entry with basic only."""
         return await self._create_config_entry(
-            selected_parameters=getattr(self, '_selected_basic_params', [])
+            selected_parameters=self._selected_basic_params
         )
 
     async def async_step_show_expert(self, user_input=None) -> ConfigFlowResult:
         """Step 7c: Expert parameter selection."""
         if user_input is not None:
             expert_selected = user_input.get("selected_expert_parameters", [])
-            basic_selected = getattr(self, '_selected_basic_params', [])
+            basic_selected = self._selected_basic_params
             all_selected = basic_selected + expert_selected
             return await self._create_config_entry(selected_parameters=all_selected)
 
@@ -466,25 +549,17 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
     # ------------------------------------------------------------------
 
     async def _create_config_entry(self, selected_parameters: list[str] | None = None) -> ConfigFlowResult:
-        if self._conn_type == CONN_TYPE_SERIAL:
-            unique_id = f"serial:{self._serial_device}"
-        else:
-            unique_id = f"{self._host}:{self._port}"
-        await self.async_set_unique_id(unique_id)
+        # The unique ID was set in the network/serial step; re-check it in case
+        # the same heater was added by another flow in the meantime.
         self._abort_if_unique_id_configured()
 
         data: dict[str, Any] = {
             CONF_DEVICE_NAME: self._device_name,
-            CONF_CONNECTION_TYPE: self._conn_type,
+            **self._connection_data(),
             CONF_SELECTED_SENSORS: self._selected_sensors,
             CONF_WRITE_ENABLED: self._write_enabled,
             CONF_SELECTED_PARAMETERS: selected_parameters or [],
         }
-        if self._conn_type == CONN_TYPE_SERIAL:
-            data[CONF_SERIAL_DEVICE] = self._serial_device
-        else:
-            data[CONF_HOST] = self._host
-            data[CONF_PORT] = self._port
 
         # -----------------------------------------------------------------------
         # Bug 1 fix: store writable parameter titles so the coordinator can label
@@ -531,18 +606,26 @@ class FroelingConfigFlow(ConfigFlow, domain=DOMAIN):
         conn_type = entry.data.get(CONF_CONNECTION_TYPE, CONN_TYPE_NETWORK)
 
         if user_input is not None:
-            client = _create_client_from_data(user_input | {CONF_CONNECTION_TYPE: conn_type})
+            new_data = {**entry.data, **user_input}
+            uid = _unique_id(new_data)
+            # Unchanged settings: validate over the entry's live connection
+            # rather than opening a second one to the same bridge.
+            if uid == _unique_id(entry.data):
+                client_cm = _entry_client(entry)
+            else:
+                # A heater another entry already owns: abort before connecting
+                # to it (and before two entries end up sharing one heater).
+                await self.async_set_unique_id(uid)
+                self._abort_if_unique_id_configured()
+                client_cm = _temporary_client(new_data)
             try:
-                await client.connect()
-                await client.check_connection()
-                await client.disconnect()
+                async with client_cm as client:
+                    reachable = await client.check_connection()
             except Exception:
+                reachable = False
+            if not reachable:
                 errors["base"] = "cannot_connect"
             else:
-                new_data = dict(entry.data)
-                new_data.update(user_input)
-                uid = (f"serial:{user_input.get(CONF_SERIAL_DEVICE, '')}" if conn_type == CONN_TYPE_SERIAL
-                       else f"{user_input.get(CONF_HOST, '')}:{user_input.get(CONF_PORT, '')}")
                 return self.async_update_reload_and_abort(
                     entry, unique_id=uid, title=new_data.get(CONF_DEVICE_NAME, entry.title), data=new_data)
 
@@ -583,17 +666,25 @@ class FroelingOptionsFlow(OptionsFlow):
         sensor_options: list[SelectOptionDict] = []
         param_options: list[SelectOptionDict] = []
         try:
-            client = _create_client_from_data(self._config_entry.data)
-            try:
-                await client.connect()
-                discovered = await _validate_and_discover(client)
+            async with _entry_client(self._config_entry) as client:
+                # Prefer what setup cached: walking the controller's value and
+                # menu lists takes minutes on a P1 and, on a loaded entry,
+                # holds the shared connection (polls and writes wait).  The
+                # coordinator only polls cached specs anyway.
+                discovered = await _validate_and_discover(
+                    client, cached_specs(self._config_entry.data)
+                )
                 sensor_options, _ = _sensors_to_select_options(discovered)
                 if self._config_entry.data.get(CONF_WRITE_ENABLED, False):
-                    menu_items = await client.discover_menu()
-                    writable = await client.get_writable_parameters(menu_items)
+                    # All writable parameters found during setup, by title.
+                    titles = cached_parameter_titles(self._config_entry.data)
+                    if titles:
+                        writable = await client.read_parameters(titles)
+                    else:
+                        writable = await client.get_writable_parameters(
+                            await client.discover_menu()
+                        )
                     param_options = _params_to_select_options(writable)
-            finally:
-                await client.disconnect()
         except Exception:
             _LOGGER.warning("Options flow: could not discover sensors/parameters")
 

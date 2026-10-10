@@ -26,7 +26,6 @@ from custom_components.froeling.pyfroeling.commands import (
     build_get_dig_in_request,
     build_get_dig_out_request,
     build_get_error_request,
-    build_get_menu_list_request,
     build_get_parameter_request,
     build_get_state_request,
     build_get_value_list_request,

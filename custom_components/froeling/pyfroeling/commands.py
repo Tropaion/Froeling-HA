@@ -31,7 +31,7 @@ import struct
 from datetime import datetime
 from typing import Any
 
-from .const import Command, MenuStructType
+from .const import Command
 from .models import ErrorState
 
 

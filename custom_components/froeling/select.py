@@ -197,6 +197,9 @@ class FroelingSelectEntity(FroelingEntity, SelectEntity):
         self._factor = param.factor
         self._min_value = low
 
+        # Option shown while a write is in flight (None: show coordinator data)
+        self._optimistic_option: str | None = None
+
     @property
     def current_option(self) -> str | None:
         """Return the currently active option label.
@@ -205,7 +208,7 @@ class FroelingSelectEntity(FroelingEntity, SelectEntity):
         reads from the coordinator snapshot.
         """
         # Return optimistic value immediately after a write
-        if getattr(self, '_optimistic_option', None) is not None:
+        if self._optimistic_option is not None:
             return self._optimistic_option
 
         if self.coordinator.data is None:

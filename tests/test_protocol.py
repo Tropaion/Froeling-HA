@@ -10,7 +10,6 @@ Test classes:
 
 from __future__ import annotations
 
-import struct
 from datetime import datetime
 
 import pytest

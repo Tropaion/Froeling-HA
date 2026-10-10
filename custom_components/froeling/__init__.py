@@ -38,8 +38,6 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
-    from .coordinator import FroelingCoordinator
-
 
 # ---------------------------------------------------------------------------
 # Platform list (plain strings – no HA import needed at module level)
@@ -83,26 +81,13 @@ async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool
     """
     # HA imports are deferred to here to avoid breaking pyfroeling unit tests
     # that run without a full HA environment installed.
-    from homeassistant.const import Platform
     from homeassistant.exceptions import ConfigEntryNotReady
 
-    from .const import (
-        CONF_CONNECTION_TYPE, CONF_HOST, CONF_PORT,
-        CONF_SERIAL_DEVICE, CONN_TYPE_SERIAL,
-    )
-    from .coordinator import FroelingCoordinator
-    from .pyfroeling import FroelingClient, FroelingConnectionError
+    from .coordinator import FroelingCoordinator, create_client
+    from .pyfroeling import FroelingConnectionError
 
-    conn_type = entry.data.get(CONF_CONNECTION_TYPE, "network")
-    if conn_type == CONN_TYPE_SERIAL:
-        device = entry.data.get(CONF_SERIAL_DEVICE, "")
-        _LOGGER.debug("Setting up Fröling integration via serial: %s", device)
-        client = FroelingClient(serial_device=device)
-    else:
-        host = entry.data.get(CONF_HOST, "")
-        port = entry.data.get(CONF_PORT, 0)
-        _LOGGER.debug("Setting up Fröling integration via TCP: %s:%d", host, port)
-        client = FroelingClient(host=host, port=port)
+    _LOGGER.debug("Setting up Fröling integration for %s", entry.unique_id)
+    client = create_client(entry.data)
 
     try:
         await client.connect()
@@ -110,6 +95,14 @@ async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool
         raise ConfigEntryNotReady(
             f"Cannot connect to Fröling heater: {exc}"
         ) from exc
+
+    # Close the connection whenever this entry goes away: on unload, and also
+    # when the rest of setup fails or is cancelled (HA runs on_unload
+    # callbacks then too, then retries with a brand-new client).  Otherwise
+    # each retry, e.g. HA booting before the heater after a power outage,
+    # would leak a TCP session, and bridges that accept only one client
+    # would refuse or kick the next one.
+    entry.async_on_unload(client.disconnect)
 
     # Create the coordinator that owns the polling loop.
     coordinator = FroelingCoordinator(hass, entry, client)
@@ -123,11 +116,9 @@ async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool
     # entry.runtime_data without going through hass.data.
     entry.runtime_data = coordinator
 
-    # Resolve platform enum values and delegate entity creation to them.
-    # Platform.NUMBER and Platform.SELECT are added for write mode support
-    # (they are no-ops when write mode is disabled in the config entry).
-    platforms = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.NUMBER, Platform.SELECT]
-    await hass.config_entries.async_forward_entry_setups(entry, platforms)
+    # Delegate entity creation to the platforms.  "number" and "select" are
+    # no-ops when write mode is disabled in the config entry.
+    await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS_STR)
 
     # Listen for options changes (e.g. polling interval) so they take
     # effect without a full restart.
@@ -167,20 +158,10 @@ async def async_unload_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> boo
     bool
         True if all platforms unloaded successfully; False otherwise.
     """
-    from homeassistant.const import Platform
-
     _LOGGER.debug("Unloading Fröling integration entry %s", entry.entry_id)
 
-    platforms = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.NUMBER, Platform.SELECT]
-
-    # Tell HA to remove all entities registered by our platforms.
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
-
-    if unload_ok:
-        # Disconnect the TCP client so the serial bridge can accept new
-        # connections (many TCP-to-serial converters allow only one TCP client).
-        coordinator: FroelingCoordinator = entry.runtime_data
-        await coordinator.client.disconnect()
-        _LOGGER.debug("Fröling TCP client disconnected")
-
-    return unload_ok
+    # Tell HA to remove all entities registered by our platforms.  The client
+    # is disconnected afterwards by the on_unload callback registered in
+    # async_setup_entry, so the bridge can accept the next connection (many
+    # TCP-to-serial converters allow only one TCP client).
+    return await hass.config_entries.async_unload_platforms(entry, _PLATFORMS_STR)

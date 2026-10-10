@@ -165,13 +165,16 @@ class FroelingNumberEntity(FroelingEntity, NumberEntity):
         # Remember the factor for encode/decode during set operations
         self._factor = param.factor
 
+        # Value shown while a write is in flight (None: show coordinator data)
+        self._optimistic_value: float | None = None
+
     @property
     def native_value(self) -> float | None:
         """Return the current parameter value.
 
         Returns optimistic value if a write is pending, otherwise from coordinator.
         """
-        if getattr(self, '_optimistic_value', None) is not None:
+        if self._optimistic_value is not None:
             return self._optimistic_value
 
         if self.coordinator.data is None:

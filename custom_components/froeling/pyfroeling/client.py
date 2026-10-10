@@ -23,22 +23,53 @@ Typical usage::
     await client.disconnect()
 
 All public methods acquire the connection lock internally so that concurrent
-callers from the same event-loop do not interleave frames.
+callers from the same event-loop do not interleave frames.  Paginated reads
+(FIRST/NEXT list walks) hold it across all their pages, so no other request
+(a poll's, or a write) can land between two pages of the same list.
+
+Stream synchronisation
+----------------------
+The protocol is strictly one request → one response with no request IDs, so
+a single extra or missing byte would otherwise shift every following
+request/response pair (the classic symptom: everything "unavailable" after the
+heater restarts until the integration is reloaded).  The client therefore:
+
+  - discards stale input before every request,
+  - lets the connection skip garbage in front of a response's sync word,
+  - marks the stream "dirty" after ANY failed exchange (timeout, framing or
+    CRC error, unparseable payload, cancellation), and
+  - before the next request on a dirty stream, drains the line until it is
+    quiet, sends ONE CHECK ping and reads frames until its echo arrives.
+    The controller answers strictly in order, so that echo proves every older
+    reply has been consumed (linux-p4d drains after every request and
+    re-opens the line after a failed check).  If no echo arrives the
+    connection is reset, so the coordinator's next poll reconnects with a
+    fresh, empty stream.
+
+All CHECK echoes look identical.  A CHECK whose echo was never read (it timed
+out, was answered by a stale frame, or its caller was cancelled) could
+therefore be mistaken for the echo of the next resync's CHECK, leaving that
+CHECK's echo to be read as the reply to the following request.  Two guards
+prevent that from ever producing wrong data:
+
+  - the client remembers when an unanswered CHECK was sent and, before the
+    next resync, drains until two timeouts have passed since then (this
+    survives reconnects: the bridge's serial line outlives the TCP session);
+  - a reply carrying the CHECK text is never accepted as the answer to any
+    other request; it fails that request and triggers a fresh resync instead.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Optional
-
-_LOGGER = logging.getLogger(__name__)
+import struct
+from collections.abc import Iterable, Mapping
+from typing import Any, Callable, Optional
 
 from .commands import (
     _normalize_unit,
     build_check_request,
-    build_get_anl_out_request,
-    build_get_dig_in_request,
-    build_get_dig_out_request,
     build_get_error_request,
     build_get_menu_list_request,
     build_get_parameter_request,
@@ -48,7 +79,6 @@ from .commands import (
     build_get_version_request,
     build_set_parameter_request,
     parse_error_response,
-    parse_io_response,
     parse_menu_entry_response,
     parse_parameter_response,
     parse_set_parameter_response,
@@ -65,7 +95,6 @@ from .models import (
     ConfigParameter,
     ErrorEntry,
     HeaterStatus,
-    IoValue,
     MenuItem,
     SensorValue,
     ValueSpec,
@@ -84,6 +113,22 @@ _log = logging.getLogger(__name__)
 # the ~120 unique sensors on a P1 even with heavy duplication, while still
 # providing a safety cap against infinite loops from misbehaving firmware.
 _MAX_PAGES: int = 1000
+
+# How long the line must stay silent before a re-synchronisation drain stops.
+# TCP-to-serial bridges forward UART data in packets, so this is well above
+# p4d's 10 ms for a local tty.  Only spent after an error.
+_RESYNC_QUIET: float = 0.25
+
+# Upper bound on a single re-synchronisation drain.
+_RESYNC_MAX_DRAIN: float = 3.0
+
+# Frames read while waiting for the resync CHECK's echo before the connection
+# is reset.  Stale replies still in flight (at most one or two per failed
+# request) are skipped; the budget only guards against an endless stream.
+_RESYNC_MAX_FRAMES: int = 8
+
+# The CHECK payload; the controller echoes it verbatim.
+_CHECK_CMD, _CHECK_PAYLOAD = build_check_request()
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +178,9 @@ class FroelingClient:
         TCP port the bridge listens on (commonly 8899).
     timeout:
         Per-operation timeout in seconds (default: 5.0).
+    resync_quiet:
+        Seconds of line silence that end a re-synchronisation drain
+        (default: 0.25).  Only spent after a failed exchange or a (re)connect.
     """
 
     def __init__(
@@ -141,15 +189,32 @@ class FroelingClient:
         port: int = 0,
         serial_device: str = "",
         timeout: float = 5.0,
+        resync_quiet: float = _RESYNC_QUIET,
     ) -> None:
         # Store connection parameters so we can reconnect if needed.
         self._host = host
         self._port = port
         self._serial_device = serial_device
         self._timeout = timeout
+        self._resync_quiet = resync_quiet
 
         # The low-level connection object (works for both TCP and serial).
         self._conn: FroelingConnection = FroelingConnection(timeout=timeout)
+
+        # True when the byte stream may no longer be aligned on a frame
+        # boundary (see "Stream synchronisation" in the module docstring).
+        # Checked and cleared by _resync() before the next request.
+        self._needs_resync: bool = False
+
+        # Event-loop time at which a CHECK was sent whose echo has not been
+        # read yet (None if there is none).  That echo could still arrive and
+        # would be indistinguishable from the echo of the next resync's CHECK.
+        self._unanswered_check_at: Optional[float] = None
+
+        # Set by disconnect(): ensure_connected() must not reopen a client
+        # that was closed on purpose (e.g. on unload while a write was
+        # waiting).  An explicit connect() clears it.
+        self._closed: bool = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -167,11 +232,55 @@ class FroelingClient:
         were provided at construction time. If serial_device is set,
         opens a direct USB serial connection. Otherwise uses TCP.
 
+        Any previous connection is released first.  The new stream starts
+        out "dirty": some bridges replay serial data they buffered while no
+        client was connected, so the first request drains the line and
+        verifies alignment with a CHECK ping.
+
         Raises
         ------
         FroelingConnectionError
             If the connection cannot be established.
         """
+        # Hold the lock so a concurrent request never sees the stream swapped
+        # out underneath it.
+        async with self._conn.lock:
+            self._closed = False
+            await self._connect_locked()
+
+    async def ensure_connected(self) -> None:
+        """Connect unless the connection is already open.
+
+        Used by the coordinator before every poll and every write.  Checking
+        under the lock means two callers that both find the connection gone
+        (e.g. a poll and a write) reconnect only once.
+
+        An open-looking connection is probed by discarding whatever arrived
+        while idle: a bridge that closed the session (FIN) right after stray
+        bytes is only noticed once those bytes have been read.
+
+        Raises
+        ------
+        FroelingConnectionError
+            If the connection cannot be established, or the client was closed
+            with :meth:`disconnect`.
+        """
+        async with self._conn.lock:
+            if self._closed:
+                raise FroelingConnectionError("Client was disconnected.")
+            if self._conn.is_connected:
+                try:
+                    stale = await self._conn.discard_input()
+                except _ConnErr:
+                    self._conn.abort()          # the bridge closed the session
+                else:
+                    _warn_discarded(stale, "received while idle")
+                    return
+            _log.info("Connection to the heater lost, reconnecting")
+            await self._connect_locked()
+
+    async def _connect_locked(self) -> None:
+        """Open the connection (TCP or serial).  Lock must be held."""
         try:
             if self._serial_device:
                 # Direct USB serial connection to COM1
@@ -181,9 +290,24 @@ class FroelingClient:
                 await self._conn.connect(self._host, self._port)
         except (_ConnErr, _TimeoutErr) as exc:
             raise FroelingConnectionError(str(exc)) from exc
+        if self._closed:
+            # disconnect() ran while the connection was being opened (it does
+            # not take the lock); do not leave the new session behind.
+            self._conn.abort()
+            raise FroelingConnectionError("Client was disconnected.")
+        # The bridge may replay serial data buffered while no client was
+        # connected, so verify alignment first.  _unanswered_check_at is kept:
+        # the serial line outlives the TCP session, so the echo of a CHECK
+        # sent on the old session can still arrive on this one.
+        self._needs_resync = True
 
     async def disconnect(self) -> None:
-        """Close the connection gracefully. Safe to call when already disconnected."""
+        """Close the connection gracefully. Safe to call when already disconnected.
+
+        Afterwards :meth:`ensure_connected` refuses to reconnect until
+        :meth:`connect` is called explicitly.
+        """
+        self._closed = True
         await self._conn.disconnect()
 
     # ------------------------------------------------------------------
@@ -191,23 +315,31 @@ class FroelingClient:
     # ------------------------------------------------------------------
 
     async def check_connection(self) -> bool:
-        """Send a CHECK (0x22) ping and verify the controller echoes it back.
+        """Verify that the heater answers a CHECK (0x22) ping with an exact echo.
 
-        The CHECK command sends the fixed string "Tescht ;-)" and the controller
-        is expected to echo the same bytes.
+        The CHECK command sends the fixed string "Tescht ;-)" and the
+        controller echoes the same bytes.  That is exactly what a
+        re-synchronisation does, so this is a forced :meth:`_resync`: it also
+        leaves the stream aligned, and right after a (re)connect, which needs
+        a resync anyway, it costs one CHECK round trip instead of two.
 
         Returns
         -------
         bool
-            True if the controller responded correctly, False on any error.
+            True if the controller echoed the CHECK, False otherwise (the
+            connection is then reset, as after any failed resync).
         """
-        try:
-            cmd, payload = build_check_request()
-            response = await self._send_and_receive(cmd, payload)
-            # The controller should echo the payload verbatim.
-            return response == b"Tescht ;-)"
-        except (FroelingConnectionError, FroelingProtocolError):
-            return False
+        async with self._conn.lock:
+            if not self._conn.is_connected:
+                return False
+            # Marked before the resync so a cancellation still leaves the
+            # stream dirty for the next request.
+            self._needs_resync = True
+            try:
+                await self._resync()
+            except FroelingConnectionError:
+                return False
+            return True
 
     async def get_status(self) -> HeaterStatus:
         """Fetch the overall heater status by combining GET_STATE + GET_VERSION.
@@ -229,15 +361,21 @@ class FroelingClient:
         FroelingProtocolError
             If either response cannot be parsed.
         """
-        # --- GET_STATE ---
         state_cmd, state_payload = build_get_state_request()
-        raw_state = await self._send_and_receive(state_cmd, state_payload)
-        state_data = parse_state_response(raw_state)
-
-        # --- GET_VERSION ---
         ver_cmd, ver_payload = build_get_version_request()
-        raw_ver = await self._send_and_receive(ver_cmd, ver_payload)
-        ver_data = parse_version_response(raw_ver)
+
+        # Both requests under one lock: a write queued in between would
+        # consume a misaligned GET_STATE reply's successor and hide the
+        # misalignment that the GET_VERSION parse would otherwise reveal.
+        async with self._conn.lock:
+            # --- GET_STATE ---
+            state_data = await self._exchange(
+                state_cmd, state_payload, parse_state_response
+            )
+            # --- GET_VERSION ---
+            ver_data = await self._exchange(
+                ver_cmd, ver_payload, parse_version_response
+            )
 
         state_code: int = state_data["state"]
 
@@ -277,8 +415,7 @@ class FroelingClient:
             On communication failure.
         """
         cmd, payload = build_get_value_request(address)
-        raw = await self._send_and_receive(cmd, payload)
-        raw_value = parse_value_response(raw)
+        raw_value = await self._send_and_receive(cmd, payload, parse_value_response)
 
         # Apply the scale factor from the spec to get the physical value.
         factor = spec.factor if spec.factor else 1
@@ -316,7 +453,11 @@ class FroelingClient:
 
         Errors for individual sensors are logged at WARNING level and the
         sensor is omitted from the result dict rather than aborting the entire
-        batch.
+        batch.  The next request re-synchronises the stream first, so a failed
+        sensor can never hand its reply to the following one.  If the
+        connection had to be reset (heater not answering at all), the batch
+        is aborted with :class:`FroelingConnectionError`: every remaining
+        request would only fail with "Not connected".
 
         Parameters
         ----------
@@ -346,6 +487,10 @@ class FroelingClient:
                 results[spec.address] = sv
 
             except (FroelingConnectionError, FroelingProtocolError) as exc:
+                if not self.is_connected:
+                    # Re-synchronisation failed and the connection was reset:
+                    # every remaining request would fail too.
+                    raise
                 # Log and continue so one bad sensor doesn't abort the batch.
                 _log.warning(
                     "Failed to read sensor at address 0x%04X (%s): %s",
@@ -376,26 +521,10 @@ class FroelingClient:
         """
         specs: list[ValueSpec] = []
         seen_addresses: set[int] = set()  # Track addresses to skip duplicates
-        first = True
 
-        for page_num in range(_MAX_PAGES):
-            cmd, payload = build_get_value_list_request(first=first)
-            raw = await self._send_and_receive(cmd, payload)
-            data = parse_value_spec_response(raw)
-
-            if not data.get("more", False):
-                _log.debug(
-                    "discover_sensors: received end-of-list after %d specs", len(specs)
-                )
-                break
-
-            # The heater may send a short/empty entry with more=True.
-            # Skip it and continue to the next page (p4io.c:1089 wrnEmpty).
-            if data.get("empty", False):
-                _log.debug("discover_sensors page %d: skipping short/empty entry", page_num)
-                first = False
-                continue
-
+        for data in await self._read_pages(
+            build_get_value_list_request, parse_value_spec_response, "discover_sensors"
+        ):
             address = data["address"]
 
             # The heater often reports the same address multiple times in the
@@ -403,10 +532,9 @@ class FroelingClient:
             # Reading the same address twice gives the same value, so skip dupes.
             if address in seen_addresses:
                 _log.debug(
-                    "discover_sensors page %d: skipping duplicate address 0x%04X '%s'",
-                    page_num, address, data["title"],
+                    "discover_sensors: skipping duplicate address 0x%04X '%s'",
+                    address, data["title"],
                 )
-                first = False
                 continue
             seen_addresses.add(address)
 
@@ -417,18 +545,9 @@ class FroelingClient:
                 title     = data["title"],
                 menu_type = data["menu_type"],
             ))
-            first = False
+            _log.debug("discover_sensors: 0x%04X '%s'", address, data["title"])
 
-            _log.debug(
-                "discover_sensors page %d: 0x%04X '%s'",
-                page_num, address, data["title"],
-            )
-        else:
-            _log.warning(
-                "discover_sensors hit _MAX_PAGES limit (%d); list may be incomplete",
-                _MAX_PAGES,
-            )
-
+        _log.debug("discover_sensors: %d specs", len(specs))
         return specs
 
     async def get_parameter(self, address: int) -> ConfigParameter:
@@ -449,8 +568,7 @@ class FroelingClient:
         FroelingConnectionError / FroelingProtocolError
         """
         cmd, payload = build_get_parameter_request(address)
-        raw = await self._send_and_receive(cmd, payload)
-        data = parse_parameter_response(raw)
+        data = await self._send_and_receive(cmd, payload, parse_parameter_response)
 
         return ConfigParameter(
             address       = data["address"],
@@ -482,32 +600,18 @@ class FroelingClient:
         FroelingConnectionError / FroelingProtocolError
             On communication failure.
         """
-        entries: list[ErrorEntry] = []
-        first = True
-
-        for _ in range(_MAX_PAGES):
-            cmd, payload = build_get_error_request(first=first)
-            raw = await self._send_and_receive(cmd, payload)
-            data = parse_error_response(raw)
-
-            if not data.get("more", False):
-                break
-
-            # Skip short/empty error entries (malformed response)
-            if data.get("empty", False):
-                first = False
-                continue
-
-            entries.append(ErrorEntry(
+        return [
+            ErrorEntry(
                 number    = data["number"],
                 text      = data["text"],
                 state     = data["state"],
                 timestamp = data["timestamp"],
                 info      = data["info"],
-            ))
-            first = False
-
-        return entries
+            )
+            for data in await self._read_pages(
+                build_get_error_request, parse_error_response, "get_errors"
+            )
+        ]
 
     async def discover_menu(self) -> list[MenuItem]:
         """Read the full menu-tree structure from the controller.
@@ -538,30 +642,10 @@ class FroelingClient:
         # Track seen addresses to avoid duplicate entries (same address can
         # appear more than once in the menu tree under different parent nodes).
         seen_addresses: set[int] = set()
-        first = True
 
-        for page_num in range(_MAX_PAGES):
-            # Use FIRST command on the opening request, NEXT on all subsequent.
-            cmd, payload = build_get_menu_list_request(first=first)
-            raw = await self._send_and_receive(cmd, payload)
-            data = parse_menu_entry_response(raw)
-
-            if not data.get("more", False):
-                # End-of-list sentinel: controller has no more entries.
-                _log.debug(
-                    "discover_menu: received end-of-list after %d items", len(items)
-                )
-                break
-
-            # Controller sent a short/empty page (more=True but entry incomplete).
-            # linux-p4d p4io.c handles this as "wrnEmpty" – skip and continue.
-            if data.get("empty", False):
-                _log.debug(
-                    "discover_menu page %d: skipping short/empty entry", page_num
-                )
-                first = False
-                continue
-
+        for data in await self._read_pages(
+            build_get_menu_list_request, parse_menu_entry_response, "discover_menu"
+        ):
             address = data["address"]
 
             # The menu tree frequently lists the same address under multiple
@@ -577,10 +661,9 @@ class FroelingClient:
             # deduplicated as before.
             if address != 0 and address in seen_addresses:
                 _log.debug(
-                    "discover_menu page %d: skipping duplicate address 0x%04X '%s'",
-                    page_num, address, data["title"],
+                    "discover_menu: skipping duplicate address 0x%04X '%s'",
+                    address, data["title"],
                 )
-                first = False
                 continue
             # Only add non-zero addresses to the seen set; 0x0000 group nodes
             # are allowed to appear multiple times.
@@ -594,19 +677,12 @@ class FroelingClient:
                 address   = address,
                 title     = data["title"],
             ))
-            first = False
-
             _log.debug(
-                "discover_menu page %d: 0x%04X type=0x%02X '%s'",
-                page_num, address, data["menu_type"], data["title"],
-            )
-        else:
-            # Loop exhausted _MAX_PAGES without hitting end-of-list.
-            _log.warning(
-                "discover_menu hit _MAX_PAGES limit (%d); list may be incomplete",
-                _MAX_PAGES,
+                "discover_menu: 0x%04X type=0x%02X '%s'",
+                address, data["menu_type"], data["title"],
             )
 
+        _log.debug("discover_menu: %d items", len(items))
         return items
 
     async def set_parameter(self, address: int, value: float, factor: int) -> float:
@@ -620,9 +696,10 @@ class FroelingClient:
           4. Re-read the parameter with GET_PARAMETER (0x55) to confirm the value
              was stored correctly in EEPROM.
 
-        All steps are executed inside the connection lock (held by
-        :meth:`_send_and_receive` for step 1; held manually for steps 2-3 via the
-        same lock context used in step 1 to prevent interleaving).
+        All steps are executed while holding the connection lock for the whole
+        sequence.  Otherwise a poll waiting for the lock could slip in between
+        the two echo frames, read the second echo as its own response and
+        leave its real response behind for the write to consume.
 
         IMPORTANT: The connection is NEVER disconnected or reconnected during or
         between steps.  All communication happens on the single persistent TCP or
@@ -653,40 +730,29 @@ class FroelingClient:
             If the first echo frame cannot be parsed.
         """
         # Convert the physical float to the raw integer value for the wire.
-        # For example: value=75.5, factor=10 → raw_value=755
-        raw_value: int = int(value * factor)
+        # For example: value=75.5, factor=10 → raw_value=755.  Round rather
+        # than truncate: 0.29 * 100 is 28.999999999999996 in floating point.
+        raw_value: int = round(value * factor)
 
-        # --- Step 1: Send SET_PARAMETER and receive the first echo frame ---
-        # _send_and_receive handles the lock, frame building, and CRC verification.
-        cmd, req_payload = build_set_parameter_request(address, raw_value)
-        first_echo_raw = await self._send_and_receive(cmd, req_payload)
-
-        # Parse the first echo to confirm the controller acknowledged the write.
-        parse_set_parameter_response(first_echo_raw)
-
-        # --- Steps 2-3: Read the second echo frame (inside the connection lock) ---
-        # The Lambdatronic always sends a second confirmation frame after a write.
-        # We must consume it to keep the protocol synchronised, but its content is
-        # not useful and we intentionally ignore parse errors on it.
         async with self._conn.lock:
-            try:
-                _resp_cmd, _size, payload_with_crc = await self._conn.read_response()
-                # Strip the CRC byte (last byte) from the second echo; ignore content.
-                _second_echo = payload_with_crc[:-1] if payload_with_crc else b""
-                _log.debug(
-                    "set_parameter: consumed second echo for address 0x%04X", address
-                )
-            except Exception as exc:
-                # Log but do NOT raise – the write already succeeded.
-                # A missing or malformed second echo is non-fatal.
-                _log.debug(
-                    "set_parameter: could not read second echo for 0x%04X: %s",
-                    address, exc,
-                )
+            # --- Step 1: Send SET_PARAMETER and receive the first echo frame ---
+            # Parse it to confirm the controller acknowledged the write.
+            cmd, req_payload = build_set_parameter_request(address, raw_value)
+            await self._exchange(cmd, req_payload, parse_set_parameter_response)
 
-        # --- Step 4: Re-read to confirm the value was stored in EEPROM ---
-        confirmed_param = await self.get_parameter(address)
-        confirmed_value = confirmed_param.value
+            # --- Steps 2-3: Read the second echo frame ---
+            # The Lambdatronic sends a second confirmation frame after a write.
+            # We must consume it to keep the protocol synchronised, but its
+            # content is not useful.  Problems here are non-fatal: the write
+            # already succeeded, and _consume_extra_frame marks the stream for
+            # re-synchronisation so a late echo cannot shift later replies.
+            await self._consume_extra_frame(f"second echo for 0x{address:04X}")
+
+            # --- Step 4: Re-read to confirm the value was stored in EEPROM ---
+            gp_cmd, gp_payload = build_get_parameter_request(address)
+            confirmed = await self._exchange(gp_cmd, gp_payload, parse_parameter_response)
+
+        confirmed_value = confirmed["value"]
 
         _log.debug(
             "set_parameter: address=0x%04X requested=%s confirmed=%s",
@@ -748,32 +814,73 @@ class FroelingClient:
             {f"0x{t:02X}": c for t, c in sorted(type_counts.items())},
         )
 
+        # Skip non-writable menu types (sensors, I/O channels, etc.).
+        return await self._read_writable(
+            (item.address, item.title, item.menu_type)
+            for item in menu_items
+            if item.menu_type in WRITABLE_TYPES
+        )
+
+    async def read_parameters(self, titles: Mapping[int, str]) -> list[WritableParameter]:
+        """Read known writable parameters by address, without walking the menu.
+
+        For parameters found earlier (e.g. the titles the config flow cached at
+        setup), this skips the slow GET_MENU_LIST walk.  Their menu type is not
+        known, so it is reported as PAR.
+
+        Parameters
+        ----------
+        titles:
+            Mapping of parameter address to its human-readable title.
+
+        Returns
+        -------
+        list[WritableParameter]
+            All successfully read parameters (see :meth:`get_writable_parameters`).
+        """
+        return await self._read_writable(
+            (address, title, MenuStructType.PAR) for address, title in titles.items()
+        )
+
+    async def _read_writable(
+        self, items: Iterable[tuple[int, str, int]]
+    ) -> list[WritableParameter]:
+        """Read each ``(address, title, menu_type)`` via GET_PARAMETER.
+
+        For each item, :meth:`get_parameter` fetches the current value, limits,
+        unit, scale factor and display digits; they are merged with the title
+        and menu type into a :class:`~pyfroeling.models.WritableParameter`.
+
+        Failures for individual parameters are logged at DEBUG level and the
+        item is skipped, so one inaccessible parameter does not abort the
+        whole read.  If the connection was reset, the read is aborted with
+        :class:`FroelingConnectionError` instead of returning a truncated list.
+        """
         results: list[WritableParameter] = []
 
-        for item in menu_items:
-            # Skip non-writable menu types (sensors, I/O channels, etc.).
-            if item.menu_type not in WRITABLE_TYPES:
-                continue
-
+        for address, title, menu_type in items:
             try:
                 # Fetch the current value and metadata via GET_PARAMETER (0x55).
-                param: ConfigParameter = await self.get_parameter(item.address)
+                param: ConfigParameter = await self.get_parameter(address)
             except (FroelingConnectionError, FroelingProtocolError) as exc:
+                if not self.is_connected:
+                    # The connection was reset; every remaining read would
+                    # fail too, so report it instead of a truncated list.
+                    raise
                 # Skip this parameter; it may be inaccessible on this model.
                 _log.debug(
-                    "get_writable_parameters: skipping address 0x%04X ('%s'): %s",
-                    item.address, item.title, exc,
+                    "Skipping parameter 0x%04X ('%s'): %s", address, title, exc,
                 )
                 continue
 
-            # Apply unit normalisation using the menu item title for context
+            # Apply unit normalisation using the title for context
             # (e.g. "m" → "min" for runtime parameters).
-            unit: str = _normalize_unit(param.unit, item.title)
+            unit: str = _normalize_unit(param.unit, title)
 
             results.append(WritableParameter(
-                address       = item.address,
-                title         = item.title,           # From menu tree (has the name)
-                menu_type     = item.menu_type,
+                address       = address,
+                title         = title,                # From the menu tree (has the name)
+                menu_type     = menu_type,
                 value         = param.value,
                 unit          = unit,
                 digits        = param.digits,
@@ -784,9 +891,8 @@ class FroelingClient:
             ))
 
             _log.debug(
-                "get_writable_parameters: 0x%04X '%s' = %s %s (min=%s max=%s)",
-                item.address, item.title, param.value, unit,
-                param.min_value, param.max_value,
+                "Parameter 0x%04X '%s' = %s %s (min=%s max=%s)",
+                address, title, param.value, unit, param.min_value, param.max_value,
             )
 
         return results
@@ -795,51 +901,17 @@ class FroelingClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _get_io(self, address: int, command: Command) -> IoValue:
-        """Fetch the mode and state of a single I/O channel.
+    async def _send_and_receive(
+        self,
+        command: Command,
+        payload: bytes,
+        parser: Callable[[bytes], Any],
+    ) -> Any:
+        """Acquire the lock and perform one request/response exchange.
 
-        This is a helper used by :meth:`get_all_values` to dispatch the correct
-        GET_DIG_OUT / GET_ANL_OUT / GET_DIG_IN command.
-
-        Parameters
-        ----------
-        address:
-            16-bit channel address.
-        command:
-            The specific GET_* Command to use for this channel type.
-
-        Returns
-        -------
-        IoValue
-            Channel mode and current physical state.
-        """
-        # Build the request payload (2-byte address).
-        if command == Command.GET_DIG_OUT:
-            _, req_payload = build_get_dig_out_request(address)
-        elif command == Command.GET_ANL_OUT:
-            _, req_payload = build_get_anl_out_request(address)
-        else:  # GET_DIG_IN
-            _, req_payload = build_get_dig_in_request(address)
-
-        raw = await self._send_and_receive(command, req_payload)
-        data = parse_io_response(raw)
-
-        return IoValue(
-            address = address,
-            mode    = data["mode"],
-            state   = data["state"],
-        )
-
-    async def _send_and_receive(self, command: Command, payload: bytes) -> bytes:
-        """Acquire the lock, send a frame, receive the response, strip CRC.
-
-        This is the single choke-point for all request/response exchanges.  It:
-          1. Acquires the connection lock to prevent interleaving.
-          2. Builds the escaped wire frame via :func:`~pyfroeling.protocol.build_frame`.
-          3. Writes the frame to the stream.
-          4. Reads and un-escapes the response frame.
-          5. Strips the single trailing CRC byte.
-          6. Returns the raw payload bytes for the caller to parse.
+        This is the single choke-point for all request/response exchanges
+        except :meth:`set_parameter`, which holds the lock across several of
+        them.  See :meth:`_exchange` for the details.
 
         Parameters
         ----------
@@ -847,85 +919,330 @@ class FroelingClient:
             The :class:`~pyfroeling.const.Command` opcode to send.
         payload:
             Request payload bytes (may be empty).
+        parser:
+            Function applied to the response payload (CRC removed) while the
+            lock is still held.  Its exceptions are treated like a malformed
+            frame.
 
         Returns
         -------
-        bytes
-            Payload bytes from the response frame, CRC byte removed.
+        Any
+            ``parser(payload)``.
+        """
+        async with self._conn.lock:
+            return await self._exchange(command, payload, parser)
+
+    async def _exchange(
+        self,
+        command: Command,
+        payload: bytes,
+        parser: Callable[[bytes], Any],
+    ) -> Any:
+        """Send one request and return its (parsed) response.  Lock must be held.
+
+        Steps:
+          1. Fail fast when not connected.
+          2. Re-synchronise first if the previous exchange failed.
+          3. Discard stale input, so the read below can only see the reply to
+             THIS request.
+          4. Build, escape and write the request frame.
+          5. Read the response frame (skipping garbage before its sync word).
+          6. Verify the CRC and strip it.
+          7. Apply ``parser``.
+
+        If anything fails – including cancellation of the calling task – the
+        stream is marked dirty so the next exchange re-synchronises first.
 
         Raises
         ------
         FroelingConnectionError
-            On TCP connection / timeout errors.
+            On timeout, connection loss, or a failed re-synchronisation.  On
+            connection loss the connection is reset (``is_connected`` becomes
+            False) so the coordinator reconnects on its next poll.
         FroelingProtocolError
-            If the response command byte does not match the request, or if
-            the response payload is unexpectedly short (no CRC byte).
+            If the response frame is malformed, fails the CRC check, or its
+            payload cannot be parsed.
         """
-        async with self._conn.lock:
-            # --- Build and transmit the request ---
-            frame = build_frame(command, payload)
-            try:
-                await self._conn.write_frame(frame)
-            except (_ConnErr, _TimeoutErr) as exc:
-                raise FroelingConnectionError(
-                    f"Failed to send command {command.name}: {exc}"
-                ) from exc
-
-            # --- Read the response ---
-            try:
-                resp_cmd, _size, payload_with_crc = await self._conn.read_response()
-            except (_ConnErr, _TimeoutErr) as exc:
-                raise FroelingConnectionError(
-                    f"Failed to receive response for {command.name}: {exc}"
-                ) from exc
-            except ValueError as exc:
-                raise FroelingProtocolError(
-                    f"Malformed response for {command.name}: {exc}"
-                ) from exc
-
-            # Log the response command for debugging but do NOT enforce a
-            # strict match.  The Lambdatronic controller does not always echo
-            # the same command code -- e.g. it responds to GET_VALUE_LIST_NEXT
-            # (0x32) with 0x31 (GET_VALUE_LIST_FIRST) in the response header.
-            # linux-p4d (the reference implementation) never checks this field.
-            if resp_cmd != command.value:
-                _LOGGER.debug(
-                    "Response command 0x%02X differs from request 0x%02X (%s) "
-                    "– this is normal for some Lambdatronic commands",
-                    resp_cmd, command.value, command.name,
-                )
-
-            # Validate that there is at least one byte (the CRC).
-            if len(payload_with_crc) == 0:
-                raise FroelingProtocolError(
-                    f"Empty response for command {command.name} – missing CRC byte."
-                )
-
-            # --- Verify the response CRC ---
-            # The CRC is the last byte of payload_with_crc.
-            received_crc: int = payload_with_crc[-1]
-            payload_only: bytes = payload_with_crc[:-1]
-
-            # Reconstruct the full unescaped response frame (excluding CRC) so we
-            # can recompute the expected CRC.  The frame header is:
-            #   sync_id (2 bytes, 0x02FD) + size (2 bytes, BE) + command (1 byte)
-            # followed by the payload bytes (without CRC).
-            # Note: read_response() returns (command_byte, size, payload_with_crc)
-            # where size == len(payload_with_crc) (includes the CRC byte itself).
-            sync_bytes: bytes = COMM_ID.to_bytes(2, byteorder="big")
-            size_bytes: bytes = _size.to_bytes(2, byteorder="big")
-            crc_input: bytes = (
-                sync_bytes
-                + size_bytes
-                + bytes([resp_cmd])
-                + payload_only
+        if not self._conn.is_connected:
+            raise FroelingConnectionError(
+                f"Not connected – cannot send {command.name}."
             )
-            expected_crc: int = calculate_crc(crc_input)
 
-            if received_crc != expected_crc:
+        if self._needs_resync:
+            await self._resync()
+
+        # Dirty until this exchange completes: any exception, and also a
+        # cancellation of the calling task, leaves it set.
+        self._needs_resync = True
+        try:
+            # --- Discard stale input ---
+            _warn_discarded(await self._conn.discard_input(), f"before {command.name}")
+
+            # --- Build and transmit the request ---
+            await self._conn.write_frame(build_frame(command, payload))
+
+            # --- Read the response, verify and strip the CRC ---
+            resp_cmd, size, payload_with_crc = await self._conn.read_response()
+            payload_only = self._check_frame(command, resp_cmd, size, payload_with_crc)
+            if _is_check_echo(payload_only):
+                # The echo of an earlier CHECK (only _resync sends CHECK):
+                # replies are misaligned.
                 raise FroelingProtocolError(
-                    f"CRC mismatch for command {command.name}: "
-                    f"expected 0x{expected_crc:02X}, got 0x{received_crc:02X}."
+                    f"Received a CHECK echo in reply to {command.name}."
                 )
 
-            return payload_only
+            result = parser(payload_only)
+            self._needs_resync = False
+            return result
+
+        except _TimeoutErr as exc:
+            raise FroelingConnectionError(
+                f"Failed to receive response for {command.name}: {exc}"
+            ) from exc
+        except _ConnErr as exc:
+            # The session is gone (closed / reset by the bridge).  Drop it so
+            # is_connected turns False and the next poll reconnects.
+            self._conn.abort()
+            raise FroelingConnectionError(
+                f"Connection lost during {command.name}: {exc}"
+            ) from exc
+        except (ValueError, IndexError, KeyError, struct.error) as exc:
+            # ValueError from read_response: no sync word, implausible size or
+            # invalid escape.  The others (and ValueError, e.g. from datetime()
+            # or an enum) come from a parser choking on a CRC-valid payload,
+            # which usually means it is the reply to a different request.
+            raise FroelingProtocolError(
+                f"Malformed response for {command.name}: {exc}"
+            ) from exc
+
+    async def _read_pages(
+        self,
+        build_request: Callable[..., tuple[Command, bytes]],
+        parser: Callable[[bytes], dict[str, Any]],
+        what: str,
+    ) -> list[dict[str, Any]]:
+        """Walk a paginated FIRST/NEXT list and return its entries' parsed pages.
+
+        Holds the client lock across all pages, so no other request (a poll's
+        or a write) can land between two pages of the same list; the
+        controller keeps a single list cursor per walk.
+
+        Sends ``build_request(first=True)`` once, then ``first=False`` until a
+        page reports ``more=0`` (end of list) or ``_MAX_PAGES`` pages were
+        read (safety guard against misbehaving firmware).  Pages flagged
+        ``empty`` (more=1 but too short, linux-p4d's wrnEmpty) are skipped.
+
+        Parameters
+        ----------
+        build_request:
+            Request builder taking ``first: bool``, e.g.
+            :func:`~pyfroeling.commands.build_get_value_list_request`.
+        parser:
+            Page parser returning a dict with at least ``more`` (and
+            ``empty`` for short pages).
+        what:
+            Name used in log messages.
+
+        Raises
+        ------
+        FroelingConnectionError / FroelingProtocolError
+            On communication failure during any page request.
+        """
+        pages: list[dict[str, Any]] = []
+        async with self._conn.lock:
+            for page_num in range(_MAX_PAGES):
+                cmd, payload = build_request(first=page_num == 0)
+                data = await self._exchange(cmd, payload, parser)
+                if not data.get("more", False):
+                    break                       # end-of-list sentinel
+                if data.get("empty", False):
+                    _log.debug("%s page %d: skipping short/empty entry", what, page_num)
+                    continue
+                pages.append(data)
+            else:
+                _log.warning(
+                    "%s hit _MAX_PAGES limit (%d); list may be incomplete",
+                    what, _MAX_PAGES,
+                )
+        return pages
+
+    async def _resync(self) -> None:
+        """Bring a dirty stream back onto a frame boundary.  Lock must be held.
+
+        1. Drain the line until it has been quiet for ``resync_quiet``
+           seconds.  If an earlier CHECK is still unanswered, keep draining
+           until two timeouts have passed since it was sent, so its echo is
+           drained instead of being mistaken for ours.
+        2. Send exactly ONE CHECK ping.
+        3. Read frames until its echo arrives, skipping stale replies and
+           garbage that were still in flight.  The controller answers in
+           order, so the echo proves every older reply has been consumed.
+
+        Never send a second CHECK while the first may be unanswered: both
+        echoes are identical, and the second one would be read as the reply
+        to the next request.  If the heater does not answer, or no echo shows
+        up within ``_RESYNC_MAX_FRAMES`` frames, the connection is reset so
+        the coordinator reconnects with a fresh stream on its next poll.
+
+        Raises
+        ------
+        FroelingConnectionError
+            If re-synchronisation failed (the connection has been reset).
+        """
+        loop = asyncio.get_running_loop()
+        quiet = self._resync_quiet
+        if self._unanswered_check_at is not None:
+            # Give an unanswered CHECK's echo up to two timeouts (from when it
+            # was sent) to arrive, so it is drained instead of matched.
+            quiet = max(quiet, self._unanswered_check_at + 2 * self._timeout - loop.time())
+        reason = f"no CHECK echo within {_RESYNC_MAX_FRAMES} frames"
+
+        try:
+            _warn_discarded(
+                await self._conn.drain_input(
+                    quiet=quiet, max_duration=quiet + _RESYNC_MAX_DRAIN,
+                ),
+                "while re-synchronising",
+            )
+
+            # Bounded in total, not just per byte, because the client lock is
+            # held throughout.
+            async with asyncio.timeout(2 * self._timeout):
+                sent_at = loop.time()
+                await self._conn.write_frame(build_frame(_CHECK_CMD, _CHECK_PAYLOAD))
+                # Only now is a CHECK in flight (a failed send queued none).
+                self._unanswered_check_at = sent_at
+
+                for _ in range(_RESYNC_MAX_FRAMES):
+                    try:
+                        resp_cmd, size, payload_with_crc = await self._conn.read_response()
+                        reply = self._check_frame(
+                            _CHECK_CMD, resp_cmd, size, payload_with_crc
+                        )
+                    except (ValueError, FroelingProtocolError) as exc:
+                        # Garbage or a corrupted stale frame: keep looking.
+                        _log.debug(
+                            "Skipping malformed frame while re-synchronising: %s", exc
+                        )
+                        continue
+                    if _is_check_echo(reply):
+                        self._unanswered_check_at = None
+                        self._needs_resync = False
+                        _log.debug("Re-synchronised with the heater")
+                        return
+                    # A reply to an earlier request that arrived late: skip it.
+                    _log.debug(
+                        "Skipping stale reply while re-synchronising: %s", reply[:16].hex()
+                    )
+
+        except _TimeoutErr as exc:
+            reason = f"no reply to CHECK: {exc}"
+        except asyncio.TimeoutError:
+            reason = f"no CHECK echo within {2 * self._timeout:.1f} s"
+        except _ConnErr as exc:
+            reason = f"connection lost: {exc}"
+
+        self._conn.abort()
+        raise FroelingConnectionError(
+            f"Lost synchronisation with the heater ({reason}); connection reset."
+        )
+
+    async def _consume_extra_frame(self, what: str) -> None:
+        """Read and discard one extra response frame.  Lock must be held.
+
+        Used for the second echo the controller sends after SET_PARAMETER.
+        Failures are logged but not raised; they mark the stream dirty so the
+        next exchange re-synchronises (and a lost connection is reset).
+        """
+        self._needs_resync = True            # until the frame has been read
+        try:
+            await self._conn.read_response()
+        except _ConnErr as exc:
+            self._conn.abort()
+            _log.debug("Connection lost while reading %s: %s", what, exc)
+        except (_TimeoutErr, ValueError) as exc:
+            _log.debug("Could not read %s: %s", what, exc)
+        else:
+            self._needs_resync = False
+            _log.debug("Consumed %s", what)
+
+    @staticmethod
+    def _check_frame(
+        command: Command, resp_cmd: int, size: int, payload_with_crc: bytes
+    ) -> bytes:
+        """Verify a response frame's CRC and return its payload without the CRC.
+
+        Parameters
+        ----------
+        command:
+            The request command (for logging / error messages only).
+        resp_cmd, size, payload_with_crc:
+            The values returned by :meth:`FroelingConnection.read_response`.
+
+        Raises
+        ------
+        FroelingProtocolError
+            If the frame is empty or the CRC does not match.
+        """
+        # Log the response command for debugging but do NOT enforce a
+        # strict match.  The Lambdatronic controller does not always echo
+        # the same command code -- e.g. it responds to GET_VALUE_LIST_NEXT
+        # (0x32) with 0x31 (GET_VALUE_LIST_FIRST) in the response header.
+        # linux-p4d (the reference implementation) never checks this field.
+        if resp_cmd != command.value:
+            _log.debug(
+                "Response command 0x%02X differs from request 0x%02X (%s) "
+                "– this is normal for some Lambdatronic commands",
+                resp_cmd, command.value, command.name,
+            )
+
+        # Validate that there is at least one byte (the CRC).
+        if len(payload_with_crc) == 0:
+            raise FroelingProtocolError(
+                f"Empty response for command {command.name} – missing CRC byte."
+            )
+
+        # --- Verify the response CRC ---
+        # The CRC is the last byte of payload_with_crc.
+        received_crc: int = payload_with_crc[-1]
+        payload_only: bytes = payload_with_crc[:-1]
+
+        # Reconstruct the full unescaped response frame (excluding CRC) so we
+        # can recompute the expected CRC.  The frame header is:
+        #   sync_id (2 bytes, 0x02FD) + size (2 bytes, BE) + command (1 byte)
+        # followed by the payload bytes (without CRC).
+        # Note: read_response() returns (command_byte, size, payload_with_crc)
+        # where size == len(payload_with_crc) (includes the CRC byte itself).
+        sync_bytes: bytes = COMM_ID.to_bytes(2, byteorder="big")
+        size_bytes: bytes = size.to_bytes(2, byteorder="big")
+        crc_input: bytes = (
+            sync_bytes
+            + size_bytes
+            + bytes([resp_cmd])
+            + payload_only
+        )
+        expected_crc: int = calculate_crc(crc_input)
+
+        if received_crc != expected_crc:
+            raise FroelingProtocolError(
+                f"CRC mismatch for command {command.name}: "
+                f"expected 0x{expected_crc:02X}, got 0x{received_crc:02X}."
+            )
+
+        return payload_only
+
+
+def _is_check_echo(payload: bytes) -> bool:
+    """Return True if a response payload is the controller's echo of a CHECK.
+
+    Only the payload is compared, like linux-p4d's check(): the response
+    command byte is not reliable on this controller (see _check_frame), and
+    no other reply carries the CHECK text.
+    """
+    return payload == _CHECK_PAYLOAD
+
+
+def _warn_discarded(data: bytes, when: str) -> None:
+    """Log bytes thrown away to keep the stream aligned (helps diagnose line noise)."""
+    if data:
+        _log.warning("Discarded %d byte(s) %s: %s", len(data), when, data[:32].hex())

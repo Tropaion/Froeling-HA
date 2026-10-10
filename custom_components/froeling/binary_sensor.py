@@ -26,7 +26,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import FroelingCoordinator
 from .entity import FroelingEntity
-from .pyfroeling.const import MenuStructType
 
 _LOGGER = logging.getLogger(__name__)
 
